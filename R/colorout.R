@@ -146,11 +146,14 @@ isColorOut <- function()
 # R-level fallback for platforms without a C console hook (Windows).
 # R on Windows does not expose ptr_R_WriteConsoleEx to packages, so on
 # Windows ColorOut() enables virtual terminal processing and wraps
-# base::cat() to colorize console output with pure R code.
+# base::cat() and base::print() to colorize console output with pure R
+# code. The print() replacement stays a real S3 generic (its body starts
+# with UseMethod()) so packages that inspect S3 generics keep working.
 .colorout_env <- new.env(parent = emptyenv())
 .colorout_env$fallback_active <- FALSE
 .colorout_env$orig_cat <- NULL
 .colorout_env$orig_print <- NULL
+.colorout_env$orig_print_dispatch <- NULL
 .colorout_env$colors <- NULL
 .colorout_env$zero_limit <- NA_real_
 
@@ -459,7 +462,25 @@ isColorOut <- function()
 # Wrapper for base::print(). Catches explicit print() calls and autoprint
 # of classed objects on platforms without a C console hook. Autoprint of
 # plain atomic vectors is done in C and cannot be intercepted here.
+#
+# The wrapper must remain a real S3 generic: packages such as S7 (used by
+# ggplot2) inspect the generic's body for a UseMethod() call when
+# registering S3 methods. A plain wrapper that calls the original print()
+# makes library(ggplot2) fail with "`generic` is a function, but not an
+# S3 generic function".
+#
+# Dispatching on an extra class lets us run .colorout_print_dispatch()
+# for every print() call while still passing the original object to the
+# original generic. UseMethod() only uses the dummy object's class for
+# dispatch; the method receives the original arguments. Using a dummy
+# avoids modifying x, which would fail for S4 objects.
 .colorout_print_wrapper <- function(x, ...)
+{
+    UseMethod("print",
+              structure(list(), class = c("colorout_dispatch", class(x))))
+}
+
+.colorout_print_dispatch <- function(x, ...)
 {
     orig_print <- .colorout_env$orig_print
     orig_cat <- .colorout_env$orig_cat
@@ -502,8 +523,24 @@ enableColoroutFallback <- function()
         .colorout_env$orig_cat <- base::cat
     if(is.null(.colorout_env$orig_print))
         .colorout_env$orig_print <- base::print
+
+    # Give the wrapper the base namespace as its environment so that
+    # packages which infer a generic's package from environment() (S7)
+    # still see print() as a base generic.
+    print_wrapper <- .colorout_print_wrapper
+    environment(print_wrapper) <- asNamespace("base")
+
     .colorout_patch_base("cat", .colorout_cat_wrapper)
-    .colorout_patch_base("print", .colorout_print_wrapper)
+    .colorout_patch_base("print", print_wrapper)
+
+    tbl <- get(".__S3MethodsTable__.", envir = asNamespace("base"))
+    if(is.null(.colorout_env$orig_print_dispatch) &&
+       exists("print.colorout_dispatch", envir = tbl, inherits = FALSE))
+        .colorout_env$orig_print_dispatch <-
+            get("print.colorout_dispatch", envir = tbl, inherits = FALSE)
+    registerS3method("print", "colorout_dispatch", .colorout_print_dispatch,
+                     envir = baseenv())
+
     .colorout_env$fallback_active <- TRUE
     invisible(NULL)
 }
@@ -520,6 +557,16 @@ disableColoroutFallback <- function()
         .colorout_unpatch_base("print", .colorout_env$orig_print)
         .colorout_env$orig_print <- NULL
     }
+
+    tbl <- get(".__S3MethodsTable__.", envir = asNamespace("base"))
+    if(exists("print.colorout_dispatch", envir = tbl, inherits = FALSE)) {
+        if(is.null(.colorout_env$orig_print_dispatch))
+            rm(list = "print.colorout_dispatch", envir = tbl)
+        else
+            assign("print.colorout_dispatch",
+                   .colorout_env$orig_print_dispatch, envir = tbl)
+    }
+    .colorout_env$orig_print_dispatch <- NULL
     .colorout_env$fallback_active <- FALSE
     invisible(NULL)
 }
